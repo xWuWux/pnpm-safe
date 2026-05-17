@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# bin/nightly-audit — persistence & hygiene scanner for cron / scheduled CI
+#
+# Recommended cron (developer machine):
+#   0 2 * * * /path/to/pnpm-safe/bin/nightly-audit >> ~/.cache/pnpm-safe/nightly.log 2>&1
+#
+# Recommended CI (GitHub Actions):
+#   schedule:
+#     - cron: '0 3 * * *'
+#   steps:
+#     - run: ./bin/nightly-audit --project-only
+#
+# Exit codes:
+#   0 — clean
+#   1 — persistence artifacts or IOC strings found
+#   2 — warnings only
+#
+# Note: nightly-audit is a HYGIENE layer, not a primary prevention mechanism.
+# Primary prevention = pnpm minimumReleaseAge + blockExoticSubdeps + allowBuilds.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+CACHE_DIR="${PNPM_SAFE_CACHE:-${HOME}/.cache/pnpm-safe}"
+LOG_FILE="${PNPM_SAFE_LOG:-${HOME}/.cache/pnpm-safe/run.log}"
+AUDIT_LOG="${PNPM_SAFE_AUDIT_LOG:-${HOME}/.cache/pnpm-safe/audit.jsonl}"
+
+source "$LIB_DIR/output.sh"
+source "$LIB_DIR/ioc.sh"
+
+mkdir -p "$CACHE_DIR"
+
+# ── Parse flags ──────────────────────────────────────────────────────────────
+
+PROJECT_ONLY=0   # only scan CWD project, not home dirs
+SCAN_HOME=1
+LOCKFILES=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project-only) PROJECT_ONLY=1; SCAN_HOME=0; shift ;;
+    --lockfile)     LOCKFILES+=("$2"); shift 2 ;;
+    --help|-h)
+      cat >&2 <<EOF
+nightly-audit — persistence and hygiene scanner
+
+Usage:
+  nightly-audit                   Full scan (home dirs + project)
+  nightly-audit --project-only    CI mode: scan CWD project only
+  nightly-audit --lockfile FILE   Also scan a specific lockfile
+
+Scans:
+  - Known persistence paths (.claude/, .vscode/, systemd units, LaunchAgents)
+  - Suspicious git workflow files
+  - Campaign IOC strings in lockfiles
+  - Node modules for known payload filenames
+  - pnpm/npm/yarn lockfiles in CWD
+EOF
+      exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+ACTIVE_MODE="${PNPM_SAFE_MODE:-nightly}"
+RISK_FOUND=0
+BLOCK_TRIGGERED=0
+
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo "  pnpm-safe nightly-audit — $(date -u '+%Y-%m-%d %H:%M UTC')"
+echo "════════════════════════════════════════════════════════"
+echo ""
+
+# ── 1. Persistence artifacts on developer machine ────────────────────────────
+
+info "[ 1/6 ] Checking known persistence paths..."
+
+# Shai-Hulud / TanStack wave persistence locations
+declare -a PERSISTENCE_CHECK_PATHS=(
+  "${HOME}/.claude/router_runtime.js"
+  "${HOME}/.claude/setup.mjs"
+  "${HOME}/.vscode/setup.mjs"
+  "${HOME}/.vscode/tasks.json"
+  "${HOME}/.config/systemd/user/gh-token-monitor.service"
+  "${HOME}/Library/LaunchAgents/com.user.gh-token-monitor.plist"
+  "${HOME}/.local/bin/gh-token-monitor.sh"
+  "${HOME}/.npm/router_init.js"
+  "${HOME}/.npm/tanstack_runner.js"
+)
+
+PERSISTENCE_FOUND=0
+for path in "${PERSISTENCE_CHECK_PATHS[@]}"; do
+  if [[ -f "$path" ]]; then
+    flag_risk "BLOCK" "$path" "Persistence artifact exists on disk" "persistence_artifact"
+    # Dead-man's switch specific warning
+    if [[ "$path" == *"gh-token-monitor"* ]]; then
+      error ""
+      error "  ══════════════════════════════════════════════════════"
+      error "  ⚠️  CRITICAL: Dead-man's switch detected."
+      error "  Do NOT revoke GitHub tokens before disabling this service."
+      error "  Token revocation triggers home directory destruction."
+      error ""
+      error "  Linux:  systemctl --user stop gh-token-monitor.service"
+      error "          systemctl --user disable gh-token-monitor.service"
+      error "          rm -f ${HOME}/.config/systemd/user/gh-token-monitor.service"
+      error "          rm -f ${HOME}/.local/bin/gh-token-monitor.sh"
+      error ""
+      error "  macOS:  launchctl unload ${HOME}/Library/LaunchAgents/com.user.gh-token-monitor.plist"
+      error "          rm -f ${HOME}/Library/LaunchAgents/com.user.gh-token-monitor.plist"
+      error "  ══════════════════════════════════════════════════════"
+      error ""
+    fi
+    PERSISTENCE_FOUND=1
+  fi
+done
+[[ "$PERSISTENCE_FOUND" -eq 0 ]] && success "  No persistence artifacts found."
+
+# ── 2. Campaign IOC strings in .claude/ session logs ───────────────────────-
+
+if [[ "$SCAN_HOME" -eq 1 && -d "${HOME}/.claude" ]]; then
+  info ""
+  info "[ 2/6 ] Scanning Claude Code session logs for IOC strings..."
+  info "  (${HOME}/.claude is an explicit harvest target in the TanStack wave)"
+
+  IOC_STRINGS=(
+    "EveryBoiWeBuildIsAWormyBoi"
+    "svksjrhjkcejg"
+    "__DAEMONIZED"
+    "router_runtime"
+    "tanstack_runner"
+    "setup_bun"
+    "IfYouRevokeThisTokenItWillWipeTheComputerOfTheOwner"
+  )
+
+  SESSION_HIT=0
+  for ioc in "${IOC_STRINGS[@]}"; do
+    if grep -rl "$ioc" "${HOME}/.claude/" 2>/dev/null | grep -q .; then
+      local matching_files
+      matching_files=$(grep -rl "$ioc" "${HOME}/.claude/" 2>/dev/null | head -5 | tr '\n' ' ')
+      flag_risk "BLOCK" "${HOME}/.claude/" \
+        "Campaign IOC string '${ioc}' found in session log(s): ${matching_files}" \
+        "session_log_ioc"
+      SESSION_HIT=1
+    fi
+  done
+  [[ "$SESSION_HIT" -eq 0 ]] && success "  No IOC strings in session logs."
+else
+  info ""
+  info "[ 2/6 ] Claude Code session log scan (skipped — ${PROJECT_ONLY:+project-only mode}${SCAN_HOME:-1})"
+fi
+
+# ── 3. Suspicious GitHub Actions workflows in CWD ───────────────────────────
+
+info ""
+info "[ 3/6 ] Scanning .github/workflows/ for suspicious patterns..."
+
+WF_HIT=0
+if [[ -d ".github/workflows" ]]; then
+  # The TanStack wave injected a fake codeql_analysis.yml
+  for wf_file in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [[ -f "$wf_file" ]] || continue
+
+    # Check for pull_request_target + actions/cache (PWN request pattern)
+    if grep -q "pull_request_target" "$wf_file" 2>/dev/null && \
+       grep -q "actions/cache" "$wf_file" 2>/dev/null; then
+      flag_risk "WARN" "$wf_file" \
+        "Workflow uses pull_request_target + actions/cache — classic PWN request pattern. Audit carefully." \
+        "pwn_request_pattern"
+      WF_HIT=1
+    fi
+
+    # Check for campaign-specific strings
+    for ioc in "EveryBoiWeBuildIsAWormyBoi" "svksjrhjkcejg" "tanstack_runner" "__DAEMONIZED"; do
+      if grep -q "$ioc" "$wf_file" 2>/dev/null; then
+        flag_risk "BLOCK" "$wf_file" \
+          "Campaign IOC string '${ioc}' in workflow file" \
+          "workflow_ioc"
+        WF_HIT=1
+      fi
+    done
+  done
+  [[ "$WF_HIT" -eq 0 ]] && success "  No suspicious workflow patterns found."
+else
+  info "  (no .github/workflows/ directory)"
+fi
+
+# ── 4. Lockfile IOC scan ─────────────────────────────────────────────────────
+
+info ""
+info "[ 4/6 ] Scanning lockfiles for IOCs..."
+
+LF_HIT=0
+# Auto-detect lockfiles in CWD
+for lf in pnpm-lock.yaml package-lock.json yarn.lock; do
+  [[ -f "$lf" ]] && LOCKFILES+=("$lf")
+done
+
+if [[ ${#LOCKFILES[@]} -eq 0 ]]; then
+  info "  (no lockfiles found in CWD)"
+else
+  for lf in "${LOCKFILES[@]}"; do
+    info "  Scanning: $lf"
+    if scan_lockfile_iocs "$lf"; then
+      : # clean
+    else
+      LF_HIT=1
+    fi
+  done
+  [[ "$LF_HIT" -eq 0 ]] && success "  Lockfiles clean."
+fi
+
+# ── 5. node_modules payload filename scan ───────────────────────────────────
+
+info ""
+info "[ 5/6 ] Scanning node_modules for known payload filenames..."
+
+NM_HIT=0
+if [[ -d "node_modules" ]]; then
+  for fname in "${MALICIOUS_FILENAMES[@]}"; do
+    matches=$(find node_modules -name "$fname" -type f 2>/dev/null | head -10)
+    if [[ -n "$matches" ]]; then
+      flag_risk "BLOCK" "node_modules" \
+        "Known payload filename '${fname}' found: ${matches//$'\n'/ }" \
+        "payload_filename"
+      NM_HIT=1
+    fi
+  done
+  [[ "$NM_HIT" -eq 0 ]] && success "  node_modules clean."
+else
+  info "  (no node_modules in CWD)"
+fi
+
+# ── 6. Git history dead-drop author check ───────────────────────────────────
+
+info ""
+info "[ 6/6 ] Checking git history for dead-drop commits..."
+
+GIT_HIT=0
+if git rev-parse --git-dir &>/dev/null 2>&1; then
+  bad_commits=$(git log --all \
+    --author="${MALICIOUS_COMMIT_AUTHOR}" \
+    --format="%H %s" 2>/dev/null || true)
+  if [[ -n "$bad_commits" ]]; then
+    flag_risk "BLOCK" "git-history" \
+      "Commits from dead-drop author ${MALICIOUS_COMMIT_AUTHOR}: ${bad_commits}" \
+      "deadrop_commit"
+    GIT_HIT=1
+  fi
+  # Check for dependabout/* branch pattern
+  bad_branches=$(git branch -a 2>/dev/null | grep -o 'dependabout/[^ ]*' || true)
+  if [[ -n "$bad_branches" ]]; then
+    flag_risk "BLOCK" "git-branches" \
+      "Suspicious 'dependabout/' branch pattern found: ${bad_branches}" \
+      "deadrop_branch"
+    GIT_HIT=1
+  fi
+  [[ "$GIT_HIT" -eq 0 ]] && success "  No dead-drop commits found."
+else
+  info "  (not a git repository)"
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+echo ""
+echo "════════════════════════════════════════════════════════"
+_emit "CLEAN" "nightly-audit" "" \
+  "Scan complete: ${BLOCK_TRIGGERED} critical, $((RISK_FOUND - BLOCK_TRIGGERED)) warnings" \
+  "nightly_summary" 2>/dev/null || true
+
+if [[ "$BLOCK_TRIGGERED" -gt 0 ]]; then
+  error "RESULT: ${BLOCK_TRIGGERED} CRITICAL finding(s) — immediate action required."
+  error "        Review output above. Do NOT revoke credentials before disabling persistence."
+  echo "════════════════════════════════════════════════════════"
+  exit 1
+elif [[ "$RISK_FOUND" -gt 0 ]]; then
+  warn "RESULT: $((RISK_FOUND - BLOCK_TRIGGERED)) warning(s) — review recommended."
+  echo "════════════════════════════════════════════════════════"
+  exit 2
+else
+  success "RESULT: All checks passed. No IOCs detected."
+  echo "════════════════════════════════════════════════════════"
+  exit 0
+fi

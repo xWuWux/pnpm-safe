@@ -1,0 +1,85 @@
+# pnpm-workspace.yaml — supply chain hardening
+#
+# These are pnpm's native security settings (v10.16+, v11).
+# Copy into your project root. Adjust values to match your risk tolerance.
+#
+# Reference: https://pnpm.io/settings
+# Context:   Shai-Hulud/TanStack attack (CVE-2026-45321) — malicious packages
+#            were live for ~3 hours before detection. A 7-day age gate would
+#            have blocked the attack entirely.
+
+# ── Publish-age gate ──────────────────────────────────────────────────────
+# Minimum minutes a version must be published before pnpm will install it.
+# 10080 = 7 days. The TanStack attack versions were live for ~180 minutes.
+#
+# Options:
+#   1440   = 1 day  (good baseline, blocks most "flash" attacks)
+#   10080  = 7 days (strong; misses some legitimate same-day releases)
+#   43200  = 30 days (very conservative; for air-gapped / high-security envs)
+minimumReleaseAge: 10080
+
+# Packages exempt from the age gate (your own packages, well-established CI deps)
+# Mirror pnpm's minimumReleaseAgeExclude syntax.
+minimumReleaseAgeExclude:
+  # - '@your-org/*'       # your own published packages
+  # - 'typescript'        # rarely a supply chain target
+
+# Fail hard if no version satisfies the age constraint (don't silently fall back)
+minimumReleaseAgeStrict: true
+
+# Skip age check for registries that don't provide time metadata
+minimumReleaseAgeIgnoreMissingTime: false
+
+# ── Exotic dependency sources ─────────────────────────────────────────────
+# The TanStack attack used: "github:tanstack/router#<orphan-commit>"
+# as an optionalDependency. This setting blocks that entire class of attack
+# for transitive deps.
+#
+# IMPORTANT: This is the single most effective pnpm setting against the
+# Shai-Hulud optionalDependency propagation vector.
+blockExoticSubdeps: true
+
+# ── Trust policy ──────────────────────────────────────────────────────────
+# Fail if a package's Sigstore/OIDC trust level has *decreased* vs prior versions.
+# Note: The TanStack attack *produced* valid SLSA provenance — so trustPolicy
+# alone wouldn't have blocked it. Still valuable for catching account takeovers
+# where an attacker publishes without the trusted publisher config.
+trustPolicy: no-downgrade
+
+# Packages allowed to downgrade (e.g., legacy packages that predate SLSA)
+# trustPolicyExclude:
+#   - 'legacy-tool@1.2.3'
+
+# Ignore trust policy for packages published > 90 days ago (predates SLSA adoption)
+trustPolicyIgnoreAfter: 129600   # 90 days in minutes
+
+# ── Build script allowlist ────────────────────────────────────────────────
+# As of pnpm v11, all build scripts are blocked by default (strictDepBuilds: true).
+# Explicitly allow only what you need. This prevents lifecycle-script attacks
+# like the Shai-Hulud preinstall/postinstall/prepare vectors.
+#
+# Run `pnpm approve-builds` interactively, or set manually:
+allowBuilds:
+  # esbuild: true         # native binary, needs build
+  # core-js: false        # explicitly deny
+  # electron: true        # native binary
+  # node-sass: true       # native binary (consider sass instead)
+
+# ── Dependency resolution overrides ──────────────────────────────────────
+# Pin known-good versions of high-value targets after a supply chain incident.
+# Example: force all uses of @tanstack/react-router to the known-clean version.
+#
+# overrides:
+#   '@tanstack/react-router': '1.169.4'   # last known-clean before May 11 attack
+#   '@tanstack/router-core':  '1.169.4'
+
+# ── Deprecated version muting ─────────────────────────────────────────────
+# Suppress noisy deprecation warnings for packages you've already evaluated.
+# allowedDeprecatedVersions:
+#   request: '*'
+
+# ── Update policy ─────────────────────────────────────────────────────────
+# Prevent auto-update of packages you're still evaluating.
+# updateConfig:
+#   ignoreDependencies:
+#     - some-esm-only-package

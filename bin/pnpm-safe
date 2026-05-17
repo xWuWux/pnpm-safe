@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# pnpm-safe — supply-chain-aware pnpm wrapper
+# Informed by: Shai-Hulud 2.0 (Nov 2025), Mini Shai-Hulud TanStack wave (CVE-2026-45321, May 2026)
+#
+# Scan pipeline (per recommendation):
+#   Phase A — offline IOC scan          (fast, no network, always runs)
+#   Phase B — registry metadata risk    (networked, cached 6h)
+#   Phase C — dry-resolve gate          (pnpm --lockfile-only, ci/paranoid modes)
+#   Phase D — post-install audit        (persistence detection, always runs)
+#
+# Usage:
+#   pnpm-safe [--mode balanced|ci|paranoid] [--list-modes] [--audit-tail [N]] <pnpm args>
+#
+# Environment:
+#   PNPM_SAFE_MODE=balanced|ci|paranoid
+#   PNPM_SAFE_BLOCK=0|1            override block-on-risk
+#   PNPM_SAFE_MIN_AGE=<minutes>    override minimum release age
+#   PNPM_SAFE_CACHE=~/.cache/pnpm-safe
+#   PNPM_SAFE_LOG=~/.cache/pnpm-safe/run.log
+#   PNPM_SAFE_AUDIT_LOG=~/.cache/pnpm-safe/audit.jsonl
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+RULES_DIR="$(dirname "$SCRIPT_DIR")/rules"
+CACHE_DIR="${PNPM_SAFE_CACHE:-${HOME}/.cache/pnpm-safe}"
+CACHE_TTL="${PNPM_SAFE_CACHE_TTL:-21600}"
+DRY_RESOLVE=0
+
+source "$LIB_DIR/output.sh"
+source "$LIB_DIR/modes.sh"
+source "$LIB_DIR/registry.sh"
+source "$LIB_DIR/risk.sh"
+source "$LIB_DIR/ioc.sh"
+source "$LIB_DIR/cache.sh"
+
+mkdir -p "$CACHE_DIR"
+
+# ── CLI parsing ──────────────────────────────────────────────────────────────
+
+CLI_MODE=""
+SHOW_AUDIT=0
+AUDIT_TAIL_N=20
+declare -a PASS_ARGS=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --mode=*)        CLI_MODE="${arg#--mode=}" ;;
+    --mode)          : ;;  # next arg handled below
+    --list-modes)    list_modes; exit 0 ;;
+    --audit-tail)    SHOW_AUDIT=1 ;;
+    --audit-tail=*)  SHOW_AUDIT=1; AUDIT_TAIL_N="${arg#--audit-tail=}" ;;
+    *)               PASS_ARGS+=("$arg") ;;
+  esac
+done
+
+# Handle "--mode paranoid" (two-arg form)
+prev=""
+for arg in "$@"; do
+  [[ "$prev" == "--mode" ]] && CLI_MODE="$arg"
+  prev="$arg"
+done
+
+if [[ "$SHOW_AUDIT" -eq 1 ]]; then
+  show_audit_tail "$AUDIT_TAIL_N"
+  exit 0
+fi
+
+# Note environment overrides so apply_mode doesn't clobber explicit settings
+[[ -n "${PNPM_SAFE_MIN_AGE:-}" ]] && export PNPM_SAFE_MIN_AGE_EXPLICIT=1
+[[ -n "${PNPM_SAFE_BLOCK:-}"   ]] && export PNPM_SAFE_BLOCK_EXPLICIT=1
+
+# Apply mode (sets MIN_RELEASE_AGE_MINUTES, BLOCK_ON_RISK, DRY_RESOLVE)
+BLOCK_ON_RISK="${PNPM_SAFE_BLOCK:-1}"
+export PNPM_SAFE_CMD="pnpm ${PASS_ARGS[*]:-}"
+apply_mode
+
+# ── Command classification ───────────────────────────────────────────────────
+
+cmd="${PASS_ARGS[0]:-}"
+is_mutating_cmd() {
+  case "$cmd" in
+    install|i|add|update|up|upgrade) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if ! is_mutating_cmd; then
+  exec pnpm "${PASS_ARGS[@]}"
+fi
+
+# ── Collect explicitly-requested packages ───────────────────────────────────
+
+declare -a REQUESTED_PACKAGES=()
+for arg in "${PASS_ARGS[@]:1}"; do
+  [[ "$arg" == -* ]] && continue
+  REQUESTED_PACKAGES+=("$arg")
+done
+
+# ── Run scan pipeline ────────────────────────────────────────────────────────
+
+RISK_FOUND=0
+BLOCK_TRIGGERED=0
+
+echo ""
+info "🔍 pnpm-safe [mode: ${ACTIVE_MODE}] — pre-install checks"
+echo ""
+
+# ── Phase A: Offline IOC scan (fast, no network) ─────────────────────────────
+
+info "Phase A — Offline IOC scan"
+
+if [[ -f "pnpm-lock.yaml" ]]; then
+  scan_lockfile_iocs "pnpm-lock.yaml"
+else
+  info "  (no pnpm-lock.yaml present)"
+fi
+
+# ── Phase B: Registry metadata risk (networked, cached) ─────────────────────
+
+echo ""
+info "Phase B — Registry metadata checks"
+
+if [[ ${#REQUESTED_PACKAGES[@]} -gt 0 ]]; then
+  for pkg in "${REQUESTED_PACKAGES[@]}"; do
+    check_package "$pkg"
+  done
+elif [[ -f "package.json" ]]; then
+  while IFS= read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    check_package "$pkg"
+  done < <(extract_deps_from_package_json "package.json")
+else
+  info "  (no package.json or explicit packages — skipping)"
+fi
+
+# ── Phase C: Dry-resolve gate (ci / paranoid modes) ─────────────────────────
+
+if [[ "${DRY_RESOLVE:-0}" -eq 1 ]]; then
+  echo ""
+  info "Phase C — Dry-resolve gate (pnpm install --lockfile-only)"
+  info "  Resolving dependency graph without extracting or running scripts..."
+
+  if pnpm install --lockfile-only --ignore-scripts 2>&1 | tee /tmp/pnpm_safe_dryresolve.log; then
+    info "  Dry-resolve completed. Scanning resolved lockfile..."
+    scan_lockfile_iocs "pnpm-lock.yaml"
+    rm -f /tmp/pnpm_safe_dryresolve.log
+  else
+    warn "  Dry-resolve failed — check pnpm output above."
+    warn "  This may indicate a network issue or a version constraint problem."
+    flag_risk "WARN" "dependency-resolution" \
+      "pnpm --lockfile-only failed; install may not be reproducible" \
+      "dry_resolve_failure"
+  fi
+else
+  info "Phase C — Dry-resolve gate (skipped in ${ACTIVE_MODE} mode)"
+fi
+
+# ── Decision gate ────────────────────────────────────────────────────────────
+
+echo ""
+if [[ "$RISK_FOUND" -gt 0 ]]; then
+  if [[ "$BLOCK_ON_RISK" == "1" && "$BLOCK_TRIGGERED" -gt 0 ]]; then
+    error "═══════════════════════════════════════════════════"
+    error "🚫  Installation BLOCKED — ${BLOCK_TRIGGERED} critical finding(s) above"
+    error "    Review, then override with: PNPM_SAFE_BLOCK=0 pnpm-safe $*"
+    error "    Or switch mode:             pnpm-safe --mode balanced $*"
+    error "═══════════════════════════════════════════════════"
+    _emit "BLOCK" "install" "" "${BLOCK_TRIGGERED} critical findings blocked install" "decision"
+    exit 1
+  elif [[ "$RISK_FOUND" -gt 0 ]]; then
+    warn "⚠️  ${RISK_FOUND} risk signal(s) detected. Proceeding (${ACTIVE_MODE} mode: warn-only)."
+  fi
+else
+  success "✅ Phase A–C passed. No findings."
+fi
+
+# ── Execute real pnpm ────────────────────────────────────────────────────────
+
+echo ""
+info "Running: pnpm ${PASS_ARGS[*]}"
+_emit "ALLOW" "install" "" "pre-install checks passed; delegating to pnpm" "decision"
+pnpm "${PASS_ARGS[@]}"
+PNPM_EXIT=$?
+
+# ── Phase D: Post-install audit ──────────────────────────────────────────────
+
+echo ""
+info "Phase D — Post-install persistence audit"
+if check_persistence_after_install; then
+  info "  No persistence artifacts detected."
+else
+  error ""
+  error "  ⚠️  Persistence artifacts found after install."
+  error "  See Phase D output above for remediation steps."
+  error "  Do NOT revoke credentials before disabling the dead-man's switch."
+fi
+
+echo ""
+exit $PNPM_EXIT

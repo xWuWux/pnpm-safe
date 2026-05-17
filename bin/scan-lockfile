@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# bin/scan-lockfile — standalone lockfile IOC scanner
+#
+# Usage:
+#   scan-lockfile [lockfile]          # defaults to pnpm-lock.yaml
+#   scan-lockfile --help
+#
+# Designed for CI pipelines where you want to audit a lockfile without
+# running pnpm install. Returns exit code 1 if BLOCK-level issues found.
+#
+# CI example (GitHub Actions):
+#   - name: Scan lockfile for supply chain IOCs
+#     run: ./bin/scan-lockfile pnpm-lock.yaml
+#
+# The lockfile is the highest-value artifact for supply chain auditing:
+# exact pinned versions, reproducible, CI-friendly, deterministic.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+CACHE_DIR="${PNPM_SAFE_CACHE:-${HOME}/.cache/pnpm-safe}"
+LOG_FILE="${PNPM_SAFE_LOG:-${HOME}/.cache/pnpm-safe/audit.log}"
+BLOCK_ON_RISK=1
+DRY_RESOLVE=0
+CLI_MODE=""
+
+source "$LIB_DIR/output.sh"
+source "$LIB_DIR/modes.sh"
+source "$LIB_DIR/registry.sh"
+source "$LIB_DIR/risk.sh"
+source "$LIB_DIR/ioc.sh"
+source "$LIB_DIR/cache.sh"
+
+mkdir -p "$CACHE_DIR"
+
+usage() {
+  cat >&2 <<EOF
+scan-lockfile — supply chain IOC scanner for npm/pnpm lockfiles
+
+Usage:
+  scan-lockfile [lockfile]                 Scan a lockfile (default: pnpm-lock.yaml)
+  scan-lockfile --check-age [lockfile]     Also check publish age of all pinned deps
+  scan-lockfile --registry-full [lockfile] Full registry check (slower, more thorough)
+  scan-lockfile --help                     Show this help
+
+Environment:
+  PNPM_SAFE_MIN_AGE=1440    Min package age in minutes (default: 1440 = 24h)
+  PNPM_SAFE_CACHE=~/.cache/pnpm-safe    Metadata cache directory
+
+Exit codes:
+  0 = clean
+  1 = BLOCK-level issues found
+  2 = WARN-level issues only
+EOF
+}
+
+LOCKFILE="pnpm-lock.yaml"
+CHECK_AGE=0
+REGISTRY_FULL=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)       usage; exit 0 ;;
+    --check-age)     CHECK_AGE=1; shift ;;
+    --registry-full) REGISTRY_FULL=1; CHECK_AGE=1; shift ;;
+    --mode)          CLI_MODE="$2"; shift 2 ;;
+    --mode=*)        CLI_MODE="${1#--mode=}"; shift ;;
+    --list-modes)    list_modes; exit 0 ;;
+    -*)              error "Unknown flag: $1"; usage; exit 2 ;;
+    *)               LOCKFILE="$1"; shift ;;
+  esac
+done
+
+apply_mode
+
+if [[ ! -f "$LOCKFILE" ]]; then
+  error "Lockfile not found: $LOCKFILE"
+  exit 1
+fi
+
+RISK_FOUND=0
+BLOCK_TRIGGERED=0
+
+info "🔍 scan-lockfile: scanning ${LOCKFILE}"
+echo ""
+
+# ── 1. IOC pattern matching (fast, no network) ──────────────────────────────
+info "Phase 1: IOC pattern matching (no network)..."
+scan_lockfile_iocs "$LOCKFILE"
+
+# ── 2. Optional: registry checks on all pinned versions ────────────────────
+if [[ "$REGISTRY_FULL" -eq 1 ]]; then
+  info ""
+  info "Phase 2: Registry checks on all pinned packages..."
+  info "(This makes network calls — results are cached for ${PNPM_SAFE_CACHE_TTL}s)"
+
+  # Extract package@version pairs from lockfile
+  # pnpm-lock.yaml format: "  /<pkg>/<version>:" or "  /<scope>/<pkg>/<version>:"
+  while IFS= read -r line; do
+    # Match lines like: "  /lodash/4.17.21:" or "  /@tanstack/react-router/1.169.5:"
+    if [[ "$line" =~ ^[[:space:]]+'/'([^/]+(/[^/]+)?)/([0-9][^:]+)':' ]]; then
+      local_pkg="${BASH_REMATCH[1]}"
+      local_ver="${BASH_REMATCH[3]}"
+      # Reconstruct scoped names
+      if [[ "$line" =~ ^[[:space:]]+'/@'([^/]+)/([^/]+)/([0-9][^:]+)':' ]]; then
+        local_pkg="@${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        local_ver="${BASH_REMATCH[3]}"
+      fi
+      check_package "${local_pkg}@${local_ver}"
+    fi
+  done < "$LOCKFILE"
+
+elif [[ "$CHECK_AGE" -eq 1 ]]; then
+  info ""
+  info "Phase 2: Publish-age check on all pinned packages..."
+  while IFS= read -r pkg_version; do
+    [[ -z "$pkg_version" ]] && continue
+    # Parse "name version" space-separated
+    pkg_name="${pkg_version% *}"
+    pkg_ver="${pkg_version##* }"
+    check_package_age "$pkg_name" "$pkg_ver"
+  done < <(python3 - "$LOCKFILE" <<'PYEOF'
+import sys, re
+lockfile = sys.argv[1]
+with open(lockfile) as f:
+    for line in f:
+        # Match pnpm lockfile v6/v9 package entries
+        m = re.match(r"^\s+/(@?[^/]+(?:/[^/]+)?)/([0-9][^:]+):", line)
+        if m:
+            print(m.group(1), m.group(2))
+PYEOF
+)
+fi
+
+# ── 3. Persistence check ────────────────────────────────────────────────────
+info ""
+info "Phase 3: Checking for persistence artifacts on disk..."
+check_persistence_after_install || true
+
+# ── Summary ─────────────────────────────────────────────────────────────────
+echo ""
+echo "─────────────────────────────────────────────────────"
+if [[ "$BLOCK_TRIGGERED" -gt 0 ]]; then
+  error "❌ RESULT: ${BLOCK_TRIGGERED} BLOCK-level issue(s) found. Do not install."
+  log_event "scan-lockfile BLOCKED: ${LOCKFILE} — ${BLOCK_TRIGGERED} critical issues"
+  exit 1
+elif [[ "$RISK_FOUND" -gt 0 ]]; then
+  warn "⚠️  RESULT: ${RISK_FOUND} warning(s). Review before proceeding."
+  log_event "scan-lockfile WARN: ${LOCKFILE} — ${RISK_FOUND} warnings"
+  exit 2
+else
+  success "✅ RESULT: No known IOCs detected in ${LOCKFILE}"
+  log_event "scan-lockfile CLEAN: ${LOCKFILE}"
+  exit 0
+fi
