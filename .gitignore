@@ -1,0 +1,11 @@
+# Runtime cache — never commit registry metadata
+cache/
+*.json.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs — audit trail stays local
+*.log
+audit.jsonl
