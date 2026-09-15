@@ -164,6 +164,11 @@ scan_tarball_iocs() {
 
   local tmpdir
   tmpdir=$(mktemp -d)
+  # Double-quoted so $tmpdir expands now (trap-set time) rather than at
+  # trap-fire time — intentional here since tmpdir is a fixed local value
+  # that never changes, but flagged by shellcheck as the pattern that's
+  # usually a bug (a variable that *does* change, or isn't set yet).
+  # shellcheck disable=SC2064
   trap "rm -rf $tmpdir" RETURN
 
   tar -xzf "$tarball" -C "$tmpdir" 2>/dev/null || return 0

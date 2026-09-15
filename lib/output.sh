@@ -26,6 +26,16 @@ SESSION_ID="${PNPM_SAFE_SESSION:-$(date +%s%N 2>/dev/null | sha256sum 2>/dev/nul
 AUDIT_LOG="${PNPM_SAFE_AUDIT_LOG:-${HOME}/.cache/pnpm-safe/audit.jsonl}"
 LOG_FILE="${PNPM_SAFE_LOG:-${HOME}/.cache/pnpm-safe/run.log}"
 
+# AUDIT_LOG/LOG_FILE default under ~/.cache/pnpm-safe regardless of
+# PNPM_SAFE_CACHE — they're only coincidentally the same directory as
+# CACHE_DIR in the fully-default case. Callers only `mkdir -p "$CACHE_DIR"`
+# (a documented override, PNPM_SAFE_CACHE), so setting that alone left
+# these two paths' parent directory never created, and the very first
+# _emit() call — on any finding, or even a clean run via log_allow() —
+# crashed with "No such file or directory" under `set -e`. Ensuring both
+# exist here, once, covers every entry point that sources this file.
+mkdir -p "$(dirname "$AUDIT_LOG")" "$(dirname "$LOG_FILE")" 2>/dev/null || true
+
 _json_str() {
   # Minimal safe JSON string escaping
   local s="$1"

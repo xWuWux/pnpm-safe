@@ -44,22 +44,73 @@ SHOW_AUDIT=0
 AUDIT_TAIL_N=20
 declare -a PASS_ARGS=()
 
-for arg in "$@"; do
-  case "$arg" in
-    --mode=*)        CLI_MODE="${arg#--mode=}" ;;
-    --mode)          : ;;  # next arg handled below
-    --list-modes)    list_modes; exit 0 ;;
-    --audit-tail)    SHOW_AUDIT=1 ;;
-    --audit-tail=*)  SHOW_AUDIT=1; AUDIT_TAIL_N="${arg#--audit-tail=}" ;;
-    *)               PASS_ARGS+=("$arg") ;;
+# NOTE: this used to be a `for arg in "$@"` loop, which cannot consume a
+# following value for a two-arg flag — it could only ever look at one
+# token at a time. The two-arg "--mode paranoid" form (the primary
+# example in this project's own README) relied on a *second* pass over
+# "$@" to pick CLI_MODE back up, but never removed "paranoid" from the
+# first pass's PASS_ARGS — so it silently ended up as PASS_ARGS[0],
+# making `cmd="${PASS_ARGS[0]:-}"` below evaluate to "paranoid" instead
+# of "add"/"install"/etc. is_mutating_cmd() then didn't match, the
+# entire Phase A-D scan pipeline was skipped, and `pnpm paranoid add
+# lodash` was exec'd directly — i.e. running the exact command from the
+# README performed *zero* security scanning. A while/shift loop (same
+# pattern bin/scan-lockfile already uses correctly) can consume both
+# tokens of a two-arg flag in one pass.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode=*)
+      CLI_MODE="${1#--mode=}"
+      shift
+      ;;
+    --mode)
+      shift
+      [[ $# -gt 0 ]] && { CLI_MODE="$1"; shift; }
+      ;;
+    --list-modes)
+      list_modes
+      exit 0
+      ;;
+    --audit-tail=*)
+      SHOW_AUDIT=1
+      AUDIT_TAIL_N="${1#--audit-tail=}"
+      shift
+      ;;
+    --audit-tail)
+      SHOW_AUDIT=1
+      shift
+      # `--audit-tail` alone (no number) is also valid — falls back to
+      # the default AUDIT_TAIL_N above. Only consume the next token as N
+      # if it actually looks like one, so a following flag/command isn't
+      # eaten by mistake.
+      [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]] && { AUDIT_TAIL_N="$1"; shift; }
+      ;;
+    --cache-stats)
+      cache_stats
+      exit 0
+      ;;
+    --cache-clear)
+      cache_clear
+      exit 0
+      ;;
+    --cache-purge)
+      shift
+      if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
+        cache_purge "$1"; shift
+      else
+        cache_purge
+      fi
+      exit 0
+      ;;
+    --cache-purge=*)
+      cache_purge "${1#--cache-purge=}"
+      exit 0
+      ;;
+    *)
+      PASS_ARGS+=("$1")
+      shift
+      ;;
   esac
-done
-
-# Handle "--mode paranoid" (two-arg form)
-prev=""
-for arg in "$@"; do
-  [[ "$prev" == "--mode" ]] && CLI_MODE="$arg"
-  prev="$arg"
 done
 
 if [[ "$SHOW_AUDIT" -eq 1 ]]; then
@@ -112,7 +163,15 @@ echo ""
 info "Phase A — Offline IOC scan"
 
 if [[ -f "pnpm-lock.yaml" ]]; then
-  scan_lockfile_iocs "pnpm-lock.yaml"
+  # scan_lockfile_iocs returns 1 the moment it finds ANYTHING (including
+  # WARN-level, not just BLOCK). Under `set -e`, an unguarded call here —
+  # merely being the body of this if-branch does not exempt it — aborted
+  # the whole script the instant something was found, skipping Phase
+  # B/C/D and the actual decision-gate/BLOCK-message logic below
+  # entirely. Findings are already recorded via flag_risk()
+  # (RISK_FOUND/BLOCK_TRIGGERED), so the return value only needs to not
+  # kill us here.
+  scan_lockfile_iocs "pnpm-lock.yaml" || true
 else
   info "  (no pnpm-lock.yaml present)"
 fi
@@ -144,7 +203,7 @@ if [[ "${DRY_RESOLVE:-0}" -eq 1 ]]; then
 
   if pnpm install --lockfile-only --ignore-scripts 2>&1 | tee /tmp/pnpm_safe_dryresolve.log; then
     info "  Dry-resolve completed. Scanning resolved lockfile..."
-    scan_lockfile_iocs "pnpm-lock.yaml"
+    scan_lockfile_iocs "pnpm-lock.yaml" || true
     rm -f /tmp/pnpm_safe_dryresolve.log
   else
     warn "  Dry-resolve failed — check pnpm output above."
