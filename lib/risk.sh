@@ -40,6 +40,40 @@ is_age_excluded() {
 
 # ── Main entry point ─────────────────────────────────────────────────────────
 
+# check_package_age NAME VERSION — publish-age-only check, used by
+# `scan-lockfile --check-age` as a faster middle ground between plain IOC
+# matching and the full behavioral scan (--registry-full, which also checks
+# maintainer churn, optionalDependency sources, and lifecycle scripts via
+# check_package() below). This function was called from bin/scan-lockfile
+# but never defined, so `--check-age` failed with "command not found" on
+# any lockfile containing at least one package.
+check_package_age() {
+  local pkg_name="$1" pkg_version="$2"
+  [[ -z "$pkg_version" ]] && return 0
+
+  if is_age_excluded "$pkg_name"; then
+    log_allow "$pkg_name" "$pkg_version"
+    return 0
+  fi
+
+  local age_result
+  age_result=$(score_publish_age "$pkg_name" "$pkg_version")
+  local age_score="${age_result%%:*}"
+  local age_msg="${age_result#*:}"
+
+  if [[ "$age_score" -ge "$SCORE_BLOCK_THRESHOLD" ]]; then
+    flag_risk_v "BLOCK" "$pkg_name" "$pkg_version" \
+      "Risk score ${age_score} ≥ ${SCORE_BLOCK_THRESHOLD} (block threshold). ${age_msg}" \
+      "publish_age"
+  elif [[ "$age_score" -ge "$SCORE_WARN_THRESHOLD" ]]; then
+    flag_risk_v "WARN" "$pkg_name" "$pkg_version" \
+      "Risk score ${age_score} ≥ ${SCORE_WARN_THRESHOLD} (warn threshold). ${age_msg}" \
+      "publish_age"
+  else
+    log_allow "$pkg_name" "$pkg_version"
+  fi
+}
+
 check_package() {
   local spec="$1"
   local pkg_name pkg_version
@@ -151,14 +185,21 @@ score_publish_age() {
   local age_h=$(( age_min / 60 ))
   local req_h=$(( MIN_RELEASE_AGE_MINUTES / 60 ))
 
-  if [[ "$age_min" -lt 60 ]]; then
+  # Gate on the *actual configured* policy threshold first. Previously the
+  # 24h (1440m) boundary below was checked unconditionally, so a package
+  # that already satisfied a custom threshold shorter than 24h (e.g.
+  # PNPM_SAFE_MIN_AGE=600 and a package published 15h ago, which clears a
+  # 10h policy) still scored 30 points and reported "below 10h threshold"
+  # even though it wasn't. The absolute 1h/24h tiers below only apply
+  # while the package is still younger than policy.
+  if [[ "$age_min" -ge "$MIN_RELEASE_AGE_MINUTES" ]]; then
+    echo "0:"
+  elif [[ "$age_min" -lt 60 ]]; then
     echo "50:Published only ${age_min}m ago — extreme freshness (TanStack attack window was ~3h)"
   elif [[ "$age_min" -lt 1440 ]]; then
     echo "30:Published ${age_h}h ago — below ${req_h}h threshold"
-  elif [[ "$age_min" -lt "$MIN_RELEASE_AGE_MINUTES" ]]; then
-    echo "15:Published ${age_h}h ago — fresher than ${req_h}h policy"
   else
-    echo "0:"
+    echo "15:Published ${age_h}h ago — fresher than ${req_h}h policy"
   fi
 }
 
@@ -194,8 +235,11 @@ if idx>0: print(vs[idx-1])
   added=$(comm -13 <(echo "$prev") <(echo "$cur") | tr '\n' ',')
 
   local score=0 msg=""
-  [[ -n "$removed" ]] && { score=$(( score + 20 )); msg+="Maintainer(s) removed: ${removed%; }. "; }
-  [[ -n "$added"   ]] && { score=$(( score + 10 )); msg+="Maintainer(s) added: ${added%; } (vs ${prev_version})."; }
+  # removed/added are comma-joined (tr '\n' ','); stripping a trailing
+  # "; " here never matched anything (copy/paste from a differently-joined
+  # string elsewhere), so messages always kept a trailing comma.
+  [[ -n "$removed" ]] && { score=$(( score + 20 )); msg+="Maintainer(s) removed: ${removed%,}. "; }
+  [[ -n "$added"   ]] && { score=$(( score + 10 )); msg+="Maintainer(s) added: ${added%,} (vs ${prev_version})."; }
 
   echo "${score}:${msg}"
 }
@@ -265,6 +309,9 @@ score_rules_file() {
     [[ "$line" =~ ^# || -z "$line" ]] && continue
     local level pattern reason
     read -r level pattern reason <<< "$line"
+    # $pattern intentionally unquoted: rules/suspicious.conf documents
+    # glob patterns (e.g. "@evil/*") as a supported syntax for this file.
+    # shellcheck disable=SC2053
     if [[ "$pkg_name" == $pattern ]]; then
       case "$level" in
         BLOCK) score=$(( score + 99 )); msg+="Rules file BLOCK: ${reason}. " ;;

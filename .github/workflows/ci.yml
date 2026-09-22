@@ -1,0 +1,32 @@
+name: pnpm-safe CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck bin/ and lib/
+        run: |
+          # SC2034 ("appears unused") is excluded: this codebase's config
+          # variables are set once in an entry point (bin/pnpm-safe,
+          # bin/scan-lockfile, bin/nightly-audit) and consumed by a lib
+          # file sourced via a dynamic path ($LIB_DIR/output.sh etc.),
+          # which shellcheck can't trace across — so every such variable
+          # is a false positive here, not a real dead-code finding.
+          shellcheck -S warning -e SC2034 bin/pnpm-safe bin/scan-lockfile bin/nightly-audit lib/*.sh install.sh
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run bats test suite
+        run: npm test

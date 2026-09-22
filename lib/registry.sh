@@ -10,8 +10,6 @@ parse_package_spec() {
   local name version
   if [[ "$spec" == @* ]]; then
     # scoped: @scope/name@version
-    local scope_name="${spec%%@*[^@]}"  # everything before the last @
-    # Simpler approach: split on @ carefully
     if [[ "$spec" =~ ^(@[^@]+)@(.+)$ ]]; then
       name="${BASH_REMATCH[1]}"
       version="${BASH_REMATCH[2]}"

@@ -136,7 +136,14 @@ if [[ "$SCAN_HOME" -eq 1 && -d "${HOME}/.claude" ]]; then
   SESSION_HIT=0
   for ioc in "${IOC_STRINGS[@]}"; do
     if grep -rl "$ioc" "${HOME}/.claude/" 2>/dev/null | grep -q .; then
-      local matching_files
+      # `local` is only valid inside a function — this is top-level
+      # script code, so it errored out here every time (`local: can
+      # only be used in a function`), and under `set -e` that crashed
+      # the whole script immediately. Since this is exactly the branch
+      # that fires when a campaign IOC string is actually found in the
+      # user's Claude Code session logs, the one scenario where this
+      # scan matters most was the one guaranteed to crash instead of
+      # reporting anything.
       matching_files=$(grep -rl "$ioc" "${HOME}/.claude/" 2>/dev/null | head -5 | tr '\n' ' ')
       flag_risk "BLOCK" "${HOME}/.claude/" \
         "Campaign IOC string '${ioc}' found in session log(s): ${matching_files}" \

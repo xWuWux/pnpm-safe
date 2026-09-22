@@ -19,7 +19,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+RULES_DIR="$(dirname "$SCRIPT_DIR")/rules"
 CACHE_DIR="${PNPM_SAFE_CACHE:-${HOME}/.cache/pnpm-safe}"
+CACHE_TTL="${PNPM_SAFE_CACHE_TTL:-21600}"
 LOG_FILE="${PNPM_SAFE_LOG:-${HOME}/.cache/pnpm-safe/audit.log}"
 BLOCK_ON_RISK=1
 DRY_RESOLVE=0
@@ -87,7 +89,13 @@ echo ""
 
 # ── 1. IOC pattern matching (fast, no network) ──────────────────────────────
 info "Phase 1: IOC pattern matching (no network)..."
-scan_lockfile_iocs "$LOCKFILE"
+# scan_lockfile_iocs returns 1 whenever it finds ANYTHING (BLOCK or WARN) —
+# under `set -e` a bare, unguarded call here would abort the whole script
+# the instant it found something, skipping Phase 2/3 and the summary below
+# entirely. Findings themselves are already recorded via flag_risk()
+# (RISK_FOUND/BLOCK_TRIGGERED), so the return value only needs to not kill
+# us here.
+scan_lockfile_iocs "$LOCKFILE" || true
 
 # ── 2. Optional: registry checks on all pinned versions ────────────────────
 if [[ "$REGISTRY_FULL" -eq 1 ]]; then

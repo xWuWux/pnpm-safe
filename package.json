@@ -1,0 +1,8 @@
+{
+  "name": "pnpm-safe",
+  "private": true,
+  "description": "Supply-chain-aware wrapper around pnpm — this manifest exists only to run the bash test suite (see tests/) via `npm test`. The tool itself is plain bash (bin/, lib/), no build step, nothing published.",
+  "scripts": {
+    "test": "npx --yes bats@1 tests/"
+  }
+}
